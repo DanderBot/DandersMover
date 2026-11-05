@@ -1,0 +1,1262 @@
+local addonName, NS = ...
+
+-- ============================================================
+-- LIBRARY OBJECT
+-- The public API lives on the LibStub object; internals live on NS.
+-- ============================================================
+-- MINOR 2 adds Lib:RefreshMovedTargets (see MOVED-TARGET SWEEP below).
+-- MINOR 3 adds the optional def.visibleOffset (see RECORD-TO-VISIBLE OFFSET
+-- below), and slabs clamp the way elements do.
+-- MINOR 4 adds the optional target def.partOf (Registry:WouldCreateCycle).
+-- MINOR 5 adds Lib:Lock(onDone): onDone(true) once the session has ended, onDone(false)
+-- if the unsaved-changes prompt was cancelled.
+-- MINOR 6 adds Lib:SetAnchor(addon, key, anchorSpec | nil) and Lib:Detach(addon, key)
+-- (see SCRIPTED ANCHORS below).
+-- MINOR 7 adds anchor mirroring: the anchor block's optional mirrorX / mirrorY /
+-- mirrorPosX / mirrorPosY (Solver.lua, MIRROR), also accepted by Lib:SetAnchor.
+-- MINOR 8: a getPos that fails no longer stops the editor opening (Registry:GetPos), and
+-- anchoring to a target that is not available no longer moves the frame (NS.RecenterRecord).
+-- MINOR 9 adds the short registration (def.db + def.dbKey, optional onChanged), def.secure
+-- detected from the frame when left out, automatic applying, and the watcher (def.watch,
+-- RegisterAddon's watch, Lib:GetWatcherStats). See SHORT REGISTRATION and WATCHER below.
+local MAJOR, MINOR = "DandersMover-1.0", 9
+local Lib = LibStub:NewLibrary(MAJOR, MINOR)
+if not Lib then return end
+NS.Lib = Lib
+Lib.callbacks = Lib.callbacks or LibStub("CallbackHandler-1.0"):New(Lib)
+NS.VERSION = (C_AddOns and C_AddOns.GetAddOnMetadata(addonName, "Version")) or "dev"
+
+local L = NS.L
+
+-- The shared UI toolkit. A hard dependency (RequiredDeps in the TOC), so this
+-- cannot be nil: LibStub itself would have failed to load first.
+NS.UI = LibStub("DandersUI-1.0"):NewHost("DandersMover", {
+    L     = L,
+    print = function(msg) NS:Print(msg) end,
+    -- The kit's own floating chrome (popups, the colour picker) takes its scale
+    -- from here. The mover's chrome reads NS:ChromeScale directly; it lives in
+    -- Proxy.lua, which is why the call is guarded -- the hook is only ever
+    -- invoked long after every file has loaded.
+    getScale = function() return NS.ChromeScale and NS:ChromeScale() or 1 end,
+    -- Every tooltip the mover's chrome shows is placed by NS.TooltipAnchor below.
+    tooltipAnchor = function(owner) return NS.TooltipAnchor(owner) end,
+})
+NS.UI:SetAccent(0.18, 0.612, 0.792)   -- the mover's own blue, from the old Theme.C.accent
+
+-- ============================================================
+-- TOOLTIP PLACEMENT
+-- The kit's default tooltip sits up and to the right of the CURSOR. The mover's
+-- chrome lives along the top of the screen (the strip, and any panel docked to a
+-- slab up there), where there is no room above the cursor: the client clamps the
+-- tooltip back down and it lands right under the pointer, over the button being
+-- read. So anything in the upper half of the screen hangs its tooltip BELOW the
+-- control instead -- the cursor is inside the control, so a tooltip outside it
+-- can never be under the cursor. The lower half keeps the cursor default, which
+-- has the whole screen above it to grow into.
+--
+-- `beside` (the slabs) always places off the owner: a slab is the thing being
+-- looked at, so a cursor tooltip would sit on top of it.
+-- ============================================================
+local TIP_GAP = 4
+
+function NS.TooltipAnchor(owner, beside)
+    if not (owner and owner.GetCenter) then return nil end
+    local _, cy = owner:GetCenter()
+    local sh = UIParent:GetHeight()
+    if type(cy) ~= "number" or type(sh) ~= "number" then return nil end
+    -- GetCenter is in the owner's own units; bring it to UIParent's.
+    local oe = owner.GetEffectiveScale and owner:GetEffectiveScale()
+    local ue = UIParent:GetEffectiveScale()
+    if type(oe) == "number" and type(ue) == "number" and ue > 0 then cy = cy * oe / ue end
+    if cy > sh / 2 then return "ANCHOR_BOTTOM", 0, -TIP_GAP end
+    if beside then return "ANCHOR_TOP", 0, TIP_GAP end
+    return nil
+end
+
+local Registry, Solver = NS.Registry, NS.Solver
+local pairs, ipairs, type, pcall, xpcall, geterrorhandler = pairs, ipairs, type, pcall, xpcall, geterrorhandler
+local InCombatLockdown, CreateFrame, UIParent = InCombatLockdown, CreateFrame, UIParent
+local tinsert, wipe, strsplit, strlower = table.insert, wipe, strsplit, string.lower
+local format, tconcat, tsort, abs = string.format, table.concat, table.sort, math.abs
+
+function NS:Print(msg) print("|cff2e9cc9DandersMover:|r " .. tostring(msg)) end
+function NS:Debug(msg) if NS.db and NS.db.debug then print("|cff888888DandersMover:|r " .. tostring(msg)) end end
+
+-- ============================================================
+-- SAVED VARIABLES
+-- Only editor preferences and enable toggles live here. Never positions.
+-- ============================================================
+NS.DEFAULTS = {
+    gridSize = 20, snapToGrid = true, snapToFrames = true, snapToScreen = true, showGrid = true,
+    -- Grid line width in DEVICE pixels (1-5; Grid.lua pixel-snaps it), and a
+    -- black wash over the game world while a session is open so the grid and
+    -- the frames stand out in bright zones. The dim is ON by default: the grid
+    -- lines are deliberately faint, and over a bright zone they vanished.
+    gridThickness = 1, dimBackground = true, dimAlpha = 0.4,
+    -- How close (screen units, edge to edge) a dragged element has to get before a
+    -- snap zone claims it. Fixed, not a fraction of the element: the same distance
+    -- for a raid container and for a single icon. Also the zone-highlight radius.
+    snapDistance = 25, zoneShowDistance = 50,
+    -- Both OFF by default: the measure lines and the snap-preview crosshairs
+    -- are diagnostics for someone lining a frame up to the pixel, and having
+    -- them fire on every drag frame made the screen busier than the thing
+    -- being dragged.
+    showMeasures = false, showSnapPreview = false,
+    keyboardNudge = true, panelSide = "auto", showHiddenMovers = true, showOtherAddons = false, debug = false,
+    -- How solid a mover slab's FILL is (0.1-1). Only the fill: the outline, role
+    -- colour and text stay at full strength -- see slabFillAlpha in Proxy.lua.
+    -- 0.5, not the old 0.95: the frames under the movers have to stay readable.
+    moverOpacity = 0.5,
+    -- Interacting with a mover's side panel pins it in place automatically; off = only the pin button pins.
+    autoPinPanels = true,
+    -- Size of the session chrome (top strip, element panel, toast, settings
+    -- window, and the text on the slabs). Never the slabs themselves -- see
+    -- NS:ChromeScale in Proxy.lua.
+    scale = 1,
+    stripCollapsed = false,               -- top strip folded to its slim tab
+    settingsSection = "general",          -- the settings window's last-picked rail section
+    addons = {},
+}
+
+local function applyDefaults(db, defaults)
+    for k, v in pairs(defaults) do
+        if db[k] == nil then
+            if type(v) == "table" then db[k] = {} ; applyDefaults(db[k], v) else db[k] = v end
+        end
+    end
+end
+
+-- ============================================================
+-- RECORD HELPERS
+-- ============================================================
+function NS.CopyPos(src, dst)
+    dst = dst or {}
+    wipe(dst)
+    dst.point, dst.x, dst.y = src.point, src.x, src.y
+    if src.anchor then
+        dst.anchor = { target = src.anchor.target, mode = src.anchor.mode,
+                       edge = src.anchor.edge, align = src.anchor.align,
+                       point = src.anchor.point, relPoint = src.anchor.relPoint,
+                       offsetX = src.anchor.offsetX, offsetY = src.anchor.offsetY,
+                       -- Mirror (Solver MIRROR): primary block only, so the fallback
+                       -- copy below deliberately leaves these four out.
+                       mirrorX = src.anchor.mirrorX or nil, mirrorY = src.anchor.mirrorY or nil,
+                       mirrorPosX = src.anchor.mirrorPosX, mirrorPosY = src.anchor.mirrorPosY }
+        local fb = src.anchor.fallback
+        if fb then
+            dst.anchor.fallback = { target = fb.target, mode = fb.mode,
+                                    edge = fb.edge, align = fb.align,
+                                    point = fb.point, relPoint = fb.relPoint,
+                                    offsetX = fb.offsetX, offsetY = fb.offsetY }
+        end
+    end
+    return dst
+end
+
+-- ============================================================
+-- NOTIFY (combat-aware)
+-- ============================================================
+NS.pending = {}
+
+function NS:Notify(el, reason)
+    if InCombatLockdown() and Registry:IsSecure(el) then
+        NS.pending[el.id] = reason
+        return false
+    end
+    local pos = Registry:GetPos(el)
+    -- The stand-in for a broken record is not a position; applying it would move the frame.
+    if el.recordBroken then return false end
+    xpcall(el.onChanged, geterrorhandler(), pos, reason)
+    Lib.callbacks:Fire("PositionChanged", el.addon, el.key, pos, reason)
+    return true
+end
+
+function NS:FlushPending()
+    if InCombatLockdown() then return end
+    local ids = {}
+    for id in pairs(NS.pending) do tinsert(ids, id) end
+    wipe(NS.pending)
+    for _, id in ipairs(ids) do
+        local el = Registry:Get(id)
+        if el then
+            NS:ResolveElement(el)
+            NS:Notify(el, "reapply")
+            NS:ReapplyDescendants(el.id, "parent")
+        end
+    end
+end
+
+-- ============================================================
+-- RESOLUTION
+-- ============================================================
+function NS:ParentOf(id) return Registry:ParentId(id) end
+
+-- ☠ AN ANCHORED SOLVE IS THE ONE PATH THAT CAN PUT AN ELEMENT OFF THE SCREEN.
+-- A free drag, a nudge and a typed X/Y are all clamped (Session's DragTo and
+-- clampFree); the solve is not, because it follows its target wherever the
+-- target's rect says -- and a stale rect (a frame whose container is hidden
+-- still answers GetCenter) can say anywhere. The slab goes with the element,
+-- so the handle to drag it back leaves the screen too. Reported as "snapping to
+-- invisible frames ... frames out of the screen bounds, making them unclickable".
+--
+-- ⚠ ONLY A SOLVE WITH NOTHING LEFT ON SCREEN IS TOUCHED. An element seated so
+-- that it overhangs an edge keeps its seat exactly; one no part of which can be
+-- seen is pulled back to the nearest fully-visible spot. The anchor record is
+-- never changed, so the element re-solves as normal the moment its target moves.
+function NS.KeepOnScreen(cx, cy, w, h)
+    local sw, sh = UIParent:GetWidth(), UIParent:GetHeight()
+    if not (sw and sh and w and h) then return cx, cy end
+    return Solver.KeepOnScreen(cx, cy, w, h, sw, sh)
+end
+
+-- ============================================================
+-- RECORD-TO-VISIBLE OFFSET
+-- ------------------------------------------------------------
+-- An element's getRect reports its VISIBLE rect, and that need not be centred
+-- on its record: DF's raid record places a container reserved for forty frames
+-- while its getRect measures the frames actually inside it. A drag copes
+-- (DragDelta moves the record by the visible movement), but an anchored solve
+-- writes the target VISIBLE centre into the record as a CENTER point -- which
+-- the consumer applies to its container, so the frames landed off their seat
+-- by exactly that offset.
+--
+-- def.visibleOffset(pos) -> dx, dy closes that: the visible centre sits at
+-- (pos.x + dx, pos.y + dy) for the record as given, in UIParent units. Only the
+-- consumer can answer it without a stale read, because it knows how its own
+-- container relates to the record. nil (no callback, or the callback returns
+-- nil) keeps the plain CENTER write, which is right for any element whose
+-- frame IS its visible rect.
+-- ============================================================
+local OFFSET_EPSILON = 0.01
+
+-- dx, dy or nil. Guarded: a consumer error must not take the solve down with it.
+function NS.VisibleOffset(el, pos)
+    local fn = el.visibleOffset
+    if not fn then return nil end
+    local ok, dx, dy = pcall(fn, pos)
+    if not ok then geterrorhandler()(dx) return nil end
+    if type(dx) ~= "number" or type(dy) ~= "number" then return nil end
+    return dx, dy
+end
+
+-- ☠ AN ANCHORED RECORD IS A CENTER POINT, BUT THE SOLVE THAT WRITES ONE MAY NOT RUN YET.
+-- A target that is not available holds the element, so the solve leaves x/y alone. Just
+-- setting point = "CENTER" then re-reads the old corner coordinates as a centre, and the
+-- frame jumps by half its size until the target appears. Convert them with the point, so
+-- the frame stays exactly where it is. With no size to convert by, the point stays too;
+-- the first solve writes CENTER itself.
+function NS.RecenterRecord(el, pos)
+    local point = pos.point or "CENTER"
+    if point ~= "CENTER" then
+        local w, h = Registry:GetSize(el)
+        if not w then return end
+        pos.x, pos.y = Solver.PointToCenter(point, pos.x or 0, pos.y or 0, w, h)
+    end
+    pos.point = "CENTER"
+end
+
+-- Re-solves an anchored element's absolute x/y from its target's current rect.
+-- Returns true when x/y changed. Missing/zero-size target: hold (no change).
+function NS:ResolveElement(el)
+    local pos = Registry:GetPos(el)
+    if not pos.anchor then return false end
+    -- Primary, backup, or neither. Neither means every anchor this record names
+    -- is unavailable (hidden, or a getRect that reports nothing on screen), so
+    -- hold the last solved position rather than snapping to a stale rect.
+    local a = Registry:ActiveAnchor(el)
+    if not a then return false end
+    local target = Registry:GetTarget(a.target)
+    if not target then return false end
+    -- Anchored to a part of itself (a record saved before WouldCreateCycle knew
+    -- about def.partOf): every solve would push the element one more step past
+    -- its own frame, so hold instead. Detach or drag it free to clear it.
+    if target.partOf == el.id then return false end
+    local rect = Registry:GetRect(target)
+    local w, h = Registry:GetSize(el)
+    if not rect or not w then return false end
+    local cx, cy = Solver.Resolve(a, w, h, rect, Solver.SPACING)
+    if not cx then return false end
+    -- A mirrored axis keeps its offset field equal to the plain offset that puts the
+    -- child where the mirror just did (Solver MIRROR), measured before the on-screen
+    -- pull so it describes the seat, not the rescue.
+    if a.mirrorX or a.mirrorY then
+        local ox, oy = Solver.OffsetsFor(a, w, h, rect, Solver.SPACING, cx, cy)
+        if a.mirrorX then a.offsetX = ox end
+        if a.mirrorY then a.offsetY = oy end
+    end
+    cx, cy = NS.KeepOnScreen(cx, cy, w, h)
+    -- cx/cy is where the VISIBLE centre belongs; see RECORD-TO-VISIBLE OFFSET.
+    local offX, offY = NS.VisibleOffset(el, pos)
+    if offX then
+        local nx, ny = cx - offX, cy - offY
+        -- The offset is measured from live geometry, so an exact compare would
+        -- report sub-pixel float noise as a move on every solve. The record's
+        -- point is kept: the offset was asked for THAT point.
+        if abs(nx - (pos.x or 0)) < OFFSET_EPSILON and abs(ny - (pos.y or 0)) < OFFSET_EPSILON then
+            return false
+        end
+        pos.x, pos.y = nx, ny
+        return true
+    end
+    local changed = pos.point ~= "CENTER" or pos.x ~= cx or pos.y ~= cy
+    pos.point, pos.x, pos.y = "CENTER", cx, cy
+    return changed
+end
+
+-- ============================================================
+-- CONSUMER ERRORS IN A WATCHED PASS
+-- The watcher runs several times a second without anyone asking, so a callback that
+-- throws must be heard once, not five times a second, and must not stop the elements
+-- that are fine. Rects can also be secret values in combat on 12.x: an error caused by
+-- one is not a bug in anybody's code, so it is dropped and the next tick tries again.
+-- ============================================================
+local function namesSecret(err)
+    return type(err) == "string" and err:find("secret", 1, true) ~= nil
+end
+
+-- Looked up when used rather than through the file-scope local, so a test can count reports.
+local function reportOnce(obj, err)
+    if namesSecret(err) or obj.watchReported then return end
+    obj.watchReported = true
+    _G.geterrorhandler()(err)
+end
+
+-- Reports, then keeps the watcher away from this object until it is registered again.
+-- An anchorable element and its target are one consumer object with two tables.
+local function failWatch(obj, err)
+    if namesSecret(err) then return end
+    reportOnce(obj, err)
+    obj.watchFailed = true
+    local partner = obj.element
+    if not partner then
+        local t = Registry:GetTarget(obj.id)
+        if t and t.element == obj then partner = t end
+    end
+    if partner then partner.watchFailed, partner.watchReported = true, true end
+end
+
+-- ResolveElement for a pass over many elements. An opted-out element takes the plain
+-- call, so its errors travel exactly as they did before the watcher existed.
+local function resolveForPass(el)
+    if el.watchFailed then return false end
+    if not Registry:IsWatched(el) then return NS:ResolveElement(el) end
+    local ok, res = pcall(NS.ResolveElement, NS, el)
+    if ok then return res end
+    reportOnce(el, res)
+    return false
+end
+
+-- The body of ReapplyDescendantsMany, split out so the canon memo around it can be
+-- closed on an error path as well as the normal one.
+local function reapplyMany(targetIds, reason)
+    local ids, seen = {}, {}
+    for _, targetId in ipairs(targetIds) do
+        for _, el in ipairs(Registry:Descendants(targetId)) do
+            if not seen[el.id] then
+                seen[el.id] = true
+                tinsert(ids, el.id)
+            end
+        end
+    end
+    if #ids == 0 then return end
+    local order = Solver.ResolutionOrder(ids, function(id) return NS:ParentOf(id) end)
+    for _, id in ipairs(order) do
+        local el = Registry:Get(id)
+        if el and resolveForPass(el) then NS:Notify(el, reason or "parent") end
+    end
+    -- EVERY descendant's slab re-measures, not just the ones whose record moved.
+    -- A proxy is exactly as big as the frame it stands in for, and an anchored
+    -- element can change SIZE without its solved centre changing at all (a
+    -- centre-on-centre seat, or a growth the offsets absorb) -- so "did the
+    -- record move" is the wrong question to gate the visual on. One pass, one
+    -- repaint at the end; ids with no proxy are skipped.
+    if NS.Proxy then NS.Proxy:SyncMany(order) end
+end
+
+-- Several targets moved at once (a header re-layout that shifts every sub-target):
+-- one union descendant set, ONE resolution order over it, one resolve/notify pass,
+-- so a shared descendant is solved once rather than once per target.
+function NS:ReapplyDescendantsMany(targetIds, reason)
+    -- The memo is only valid for the length of this synchronous pass, so it has to
+    -- be closed however the pass ends. Errors are reported through the usual handler
+    -- rather than swallowed.
+    Registry:BeginCanonMemo()
+    local ok, err = pcall(reapplyMany, targetIds, reason)
+    Registry:EndCanonMemo()
+    if not ok then geterrorhandler()(err) end
+end
+
+function NS:ReapplyDescendants(targetId, reason)
+    NS:ReapplyDescendantsMany({ targetId }, reason)
+end
+
+-- ============================================================
+-- MOVED-TARGET SWEEP
+-- ============================================================
+-- "Some of my targets may have RESIZED -- re-solve whatever depends on them."
+--
+-- RefreshAnchorTarget is the call for a target that MOVED, and a consumer knows
+-- when that happened: it just ran the function that moved it. A target that
+-- changed SIZE announces nothing -- the consumer's own layout code has no idea an
+-- anchor exists -- so a child snapped to a container's right edge kept the
+-- absolute x/y it was solved to back when the container was a different width.
+-- That is what this sweep is for: the consumer names the keys a layout pass can
+-- resize and calls it on its own layout tick, and the LIB works out whether
+-- anything actually needs re-solving.
+--
+-- Cheap enough to call every rendered frame: it measures the named targets and
+-- returns having done nothing unless one of them really moved.
+--
+-- ☠ THE EPSILON IS LOAD-BEARING. A rect is recomputed from live frame geometry
+-- every time it is asked for, so exact equality lets sub-pixel jitter (a scale
+-- ratio, a fractional container size) report "moved" forever, and every report
+-- re-solves and re-notifies the whole subtree. Half a pixel is below anything a
+-- user can see and above anything the maths can wobble by.
+local RECT_EPSILON = 0.5
+
+-- id -> the rect this sweep last solved that target against. Cleared on
+-- Unregister so a churning key list (a consumer re-registering its elements)
+-- cannot grow it without bound.
+NS.lastRect = {}
+
+-- Availability AND geometry in ONE measure. Registry:IsTargetAvailable would
+-- call the consumer's getRect a second time, and this runs over every key on
+-- every tick. nil = not a usable anchor target right now, which is a state of
+-- its own: nil <-> rect counts as a move, because a child holding against a
+-- vanished target has to re-solve the moment it comes back.
+local function targetRect(target)
+    if not Registry:IsRelevant(target) then return nil end
+    if target.getRect then return target.getRect() end
+    if not Registry.IsFrameVisible(Registry:GetFrame(target)) then return nil end
+    return Registry:GetRect(target)
+end
+
+local function movedSince(id, r)
+    local prev = NS.lastRect[id]
+    if r == nil then return prev ~= nil end
+    if prev == nil then return true end
+    return abs(prev.x - r.x) > RECT_EPSILON or abs(prev.y - r.y) > RECT_EPSILON
+        or abs(prev.w - r.w) > RECT_EPSILON or abs(prev.h - r.h) > RECT_EPSILON
+end
+
+local function stampRect(id, r)
+    if r == nil then NS.lastRect[id] = nil return end
+    local prev = NS.lastRect[id]
+    if prev then prev.x, prev.y, prev.w, prev.h = r.x, r.y, r.w, r.h
+    else NS.lastRect[id] = { x = r.x, y = r.y, w = r.w, h = r.h } end
+end
+
+-- Reused across sweeps: the ids that moved this pass. Safe to reuse because the
+-- sweep is re-entrancy guarded (below) and ReapplyDescendantsMany copies what it
+-- needs out of it before calling anything back into the consumer.
+local movedIds = {}
+
+-- An open panel is docked to a slab and quotes the record the sweep just
+-- re-solved, so it has to come along when either changes. Three states where it
+-- must NOT: no live session (there is nothing on screen), a combat suspend (the
+-- panels are deliberately hidden and Panel:Refresh re-shows pinned ones), and a
+-- drag in flight (onDragStart hides the FOLLOWING panel on purpose, and a
+-- refresh would plant it straight back under the cursor).
+local function refreshSessionPanel()
+    if not (NS.Panel and NS.Session) then return end
+    if not NS.Session:IsActive() or NS.Session:IsSuspended() then return end
+    if NS.Proxy and NS.Proxy:IsDragging() then return end
+    NS.Panel:Refresh()
+end
+
+-- What a measure answers for "no reading this tick": the rect is secret, or the target
+-- has failed. Not nil, because nil means the target is unavailable, which is a change.
+local SKIP_RECT = {}
+
+-- `ids` are target ids; `measure(target)` is targetRect, or the watcher's guarded version.
+local function sweepIds(ids, measure)
+    local n = 0
+    for _, id in ipairs(ids) do
+        local target = Registry:GetTarget(id)
+        if target then
+            local r = measure(target)
+            if r ~= SKIP_RECT and movedSince(target.id, r) then
+                n = n + 1
+                movedIds[n] = target.id
+            end
+        end
+    end
+    for i = n + 1, #movedIds do movedIds[i] = nil end
+    if n == 0 then return 0 end
+
+    -- A moved target that is ALSO a movable element and is itself anchored has
+    -- just had its own SIZE change, and Solver.Resolve takes the child's w/h --
+    -- so its own solved position is stale too. It has to settle BEFORE the
+    -- descendant pass, or the children solve against a rect their parent is
+    -- about to leave. ResolveElement returns false when the solve did not
+    -- actually move it, so an unanchored (or already-correct) element notifies
+    -- nothing: that is the other half of "no churn".
+    --
+    -- ⚠ THE REASONS ARE THE EXISTING ONES ON PURPOSE: "reapply" for the element
+    -- itself (what Lib:Apply sends) and "parent" for the descendants (what
+    -- RefreshAnchorTarget sends). Both mean "the lib re-solved you", which is
+    -- exactly what happened, and consumers already branch on that -- DandersFrames'
+    -- pinned sets treat any OTHER reason as a user gesture and void a pending
+    -- migration fold on it. A new reason string here would have been a silent
+    -- behaviour change in someone else's file.
+    for i = 1, n do
+        local el = Registry:Get(movedIds[i])
+        if el and resolveForPass(el) then
+            NS:Notify(el, "reapply")
+        end
+    end
+    NS:ReapplyDescendantsMany(movedIds, "parent")
+
+    -- ☠ THE SLAB HAS TO RE-MEASURE EVEN WHEN THE RECORD DID NOT CHANGE, so this
+    -- is deliberately NOT inside the ResolveElement branch above. A proxy is
+    -- exactly as big as the frame it stands in for, and a FREE element that got
+    -- wider has no anchor to re-solve: ResolveElement returns false for it, and
+    -- the old code read that as "nothing to show". So with the movers unlocked,
+    -- pulling Frame Width grew the real frames while their slab kept the size it
+    -- was built at. Reported in game as "when unlocked and changing a frame
+    -- size, the mover does not update its size".
+    --
+    -- Descendants are already synced by the pass above (reapplyMany); this is
+    -- the swept targets themselves. Ids with no proxy -- a pure anchor target,
+    -- an element outside the session filter, no session open at all -- are
+    -- skipped inside SyncMany.
+    if NS.Proxy then NS.Proxy:SyncMany(movedIds) end
+    refreshSessionPanel()
+
+    -- ☠ RE-STAMP EVERY KEY, FROM A FRESH MEASURE -- not just the ones that read
+    -- as moved at the top. The pass itself moves things: the self-resolve above,
+    -- every descendant it re-solved, and whatever the consumer's onChanged did
+    -- with the position it was handed. Anything measured before that ran is now
+    -- out of date, and stamping only the movers left each re-solved DESCENDANT
+    -- looking changed on the next tick -- one redundant pass every tick forever,
+    -- and a chain of anchors settling one link per tick instead of all at once.
+    --
+    -- The flip side, deliberate: a consumer that resizes one of these targets
+    -- from inside its own onChanged has that change absorbed here rather than
+    -- reported next tick. It is the same statement either way -- "this is the
+    -- state we have now seen" -- and the alternative is a sweep that can never
+    -- go quiet.
+    for _, id in ipairs(ids) do
+        local target = Registry:GetTarget(id)
+        if target then
+            local r = measure(target)
+            if r ~= SKIP_RECT then stampRect(target.id, r) end
+        end
+    end
+    return n
+end
+
+-- Reused across sweeps, like movedIds and under the same re-entrancy guard.
+local keyIds = {}
+
+local function sweepMoved(addon, keys)
+    local n = 0
+    for _, key in ipairs(keys) do
+        n = n + 1
+        keyIds[n] = Registry.Id(addon, key)
+    end
+    for i = n + 1, #keyIds do keyIds[i] = nil end
+    return sweepIds(keyIds, targetRect)
+end
+
+-- ============================================================
+-- PUBLIC API
+-- ============================================================
+-- Every registry mutation announces itself, so the settings list and a live
+-- session can re-render instead of showing whatever the registry looked like
+-- when they were last opened. (addon, key) name what changed; BOTH nil means
+-- "assume everything" -- that is the post-Flush case, where a whole login's
+-- worth of queued registrations landed at once.
+-- Consumers churn these in bursts (DandersFrames re-registers its entire pinned
+-- list on every add/remove), so listeners debounce rather than the fire site:
+-- a listener that wants to act once per burst can, one that wants each change
+-- still sees each one.
+local function registryChanged(addon, key)
+    Lib.callbacks:Fire("RegistryChanged", addon, key)
+end
+
+-- Its methods are in the WATCHER section further down; the API below only calls them.
+local Watcher = {}
+NS.Watcher = Watcher
+
+-- ============================================================
+-- SHORT REGISTRATION
+--   Lib:Register(addon, key, { frame = f, db = MyDB, dbKey = "bar", default = {...} })
+-- db + dbKey stand in for getPos: the record lives at db[dbKey], seeded from a copy of
+-- default, and comes back if it is later cleared. onChanged may be left out on any
+-- element and then just places the frame.
+--
+-- This is here rather than in Registry.lua because Registry never writes to frames. The
+-- caller's def is never changed: it is copied, and only when there is something to expand.
+-- ============================================================
+local function newRecord(default)
+    if default then return NS.CopyPos(default) end
+    return { point = "CENTER", x = 0, y = 0 }
+end
+
+local function expandDef(def)
+    if type(def) ~= "table" then return def end   -- Registry's validation reports this one
+    local usesDb = def.db ~= nil or def.dbKey ~= nil
+    if not usesDb and def.onChanged ~= nil then return def end
+
+    local copy = {}
+    for k, v in pairs(def) do copy[k] = v end
+    if usesDb then
+        local db, dbKey, default = def.db, def.dbKey, def.default
+        if db == nil or dbKey == nil then error("DandersMover: db and dbKey must be given together", 3) end
+        if type(db) ~= "table" then error("DandersMover: db must be a table", 3) end
+        if type(dbKey) ~= "string" and type(dbKey) ~= "number" then
+            error("DandersMover: dbKey must be a string or a number", 3)
+        end
+        if def.getPos ~= nil then error("DandersMover: give either getPos or db + dbKey, not both", 3) end
+        if default ~= nil and type(default) ~= "table" then error("DandersMover: default must be a table", 3) end
+        copy.db, copy.dbKey = nil, nil
+        copy.getPos = function()
+            local record = db[dbKey]
+            if record == nil then
+                record = newRecord(default)
+                db[dbKey] = record
+            end
+            return record
+        end
+    end
+    if def.onChanged == nil then
+        copy.onChanged = function(pos)
+            local frame = Registry:GetFrame(copy)
+            if frame then Lib.ApplyPosition(frame, pos) end
+        end
+    end
+    return copy
+end
+
+function Lib:RegisterAddon(name, info)
+    Registry:RegisterAddon(name, info)
+    registryChanged(name)
+    Watcher:Evaluate()
+end
+function Lib:Register(addon, key, def)
+    local expanded = expandDef(def)
+    local el = Registry:Register(addon, key, expanded)
+    -- After Registry's validation, so a def it refuses leaves the consumer's db alone.
+    if expanded ~= def and def.db ~= nil then expanded.getPos() end
+    registryChanged(addon, key)
+    Watcher:Registered(el, true)
+    return el
+end
+function Lib:RegisterAnchorTarget(addon, key, def)
+    local target = Registry:RegisterAnchorTarget(addon, key, def)
+    registryChanged(addon, key)
+    Watcher:Registered(target, false)
+    return target
+end
+function Lib:Unregister(addon, key)
+    local id = Registry.Id(addon, key)
+    Registry:Unregister(addon, key)
+    NS.lastRect[id] = nil
+    if NS.Proxy then NS.Proxy:Remove(id) end
+    registryChanged(addon, key)
+    if Watcher.ticker then Watcher:Evaluate() end
+end
+function Lib:UnregisterAddon(addon)
+    Registry:UnregisterAddon(addon)
+    local prefix = addon .. ":"
+    for id in pairs(NS.lastRect) do
+        if id:sub(1, #prefix) == prefix then NS.lastRect[id] = nil end
+    end
+    if NS.Proxy then NS.Proxy:RemoveAddon(addon) end
+    registryChanged(addon)
+    if Watcher.ticker then Watcher:Evaluate() end
+end
+
+-- Renames an element's key in place: the user toggle, the registry entry and every
+-- registered or queued record's anchor target move with it; the position does not.
+-- Ignored while unlocked -- a live session is keyed by the ids it opened with.
+function Lib:RenameKey(addon, old, new)
+    if Lib:IsUnlocked() then
+        NS:Debug("RenameKey ignored while unlocked: " .. tostring(old))
+        return false
+    end
+    local ok = Registry:RenameKey(addon, old, new)
+    if ok then registryChanged(addon) end
+    return ok
+end
+
+function Lib:RefreshAnchorTarget(addon, key)
+    NS:ReapplyDescendants(Registry.Id(addon, key), "parent")
+end
+
+-- Batched RefreshAnchorTarget -- one union descendant set, one resolution order, one pass.
+function Lib:RefreshAnchorTargets(addon, keys)
+    local ids = {}
+    for _, key in ipairs(keys) do tinsert(ids, Registry.Id(addon, key)) end
+    NS:ReapplyDescendantsMany(ids, "parent")
+end
+
+-- "These targets of mine may have resized." Measures each key, and re-solves the
+-- moved ones plus everything anchored to them. Returns how many actually moved,
+-- so a caller can log or skip follow-up work; 0 means the call did nothing.
+--
+-- Meant to be called on the consumer's LAYOUT tick (after a settings sweep has
+-- re-sized its frames), which is why it is guarded to a no-op rather than a
+-- nested pass: a re-solve notifies the consumer, whose apply path can land right
+-- back here through whatever drives its layout. The guard is what makes that a
+-- stop rather than a loop; the epsilon in the sweep is what makes it converge.
+--
+-- `keys` is read once, up front, so a reused scratch table is fine (it is what
+-- DandersFrames hands in), even one a consumer callback rebuilds during the pass.
+local sweeping = false
+
+function Lib:RefreshMovedTargets(addon, keys)
+    if sweeping then return 0 end
+    sweeping = true
+    local ok, res = pcall(sweepMoved, addon, keys)
+    sweeping = false
+    if not ok then geterrorhandler()(res) return 0 end
+    return res
+end
+
+function Lib:Apply(addon, key)
+    local el = Registry:Get(Registry.Id(addon, key))
+    if not el then return end
+    NS:ResolveElement(el)
+    NS:Notify(el, "reapply")
+    NS:ReapplyDescendants(el.id, "parent")
+    if NS.Proxy then NS.Proxy:Refresh(el.id) end
+end
+
+-- filter: nil (everything), "Addon" (that addon initiated the session), or
+-- { addon = "Addon", keys = {...} } (only those keys of the initiator take part, forced
+-- relevant). Other addons' enabled+relevant elements stay anchor targets in a filtered
+-- session and get proxies with DandersMoverDB.showOtherAddons. See Registry:NormalizeFilter.
+function Lib:Unlock(filter) if NS.Session then NS.Session:Unlock(filter) end end
+function Lib:Lock(onDone) if NS.Session then NS.Session:Lock(onDone) end end
+function Lib:Toggle() if NS.Session then NS.Session:Toggle() end end
+function Lib:IsUnlocked() return NS.Session and NS.Session:IsActive() or false end
+function Lib:IsEnabled(addon, key) return Registry:IsEnabled(addon, key) end
+
+-- ============================================================
+-- SCRIPTED ANCHORS
+-- Set or clear an element's anchor from outside the editor -- a settings checkbox
+-- that attaches one element to another, a "reset to attached" button.
+--
+--   Lib:SetAnchor(addon, key, spec)   spec = { target = "Addon:key", edge, align,
+--                                       mode, point, relPoint, offsetX, offsetY,
+--                                       fallback = { ... } } -- the record's own
+--                                       anchor shape; nil spec = Lib:Detach
+--   Lib:Detach(addon, key)            free the element where it sits
+--
+-- Both return false when the element is not registered; SetAnchor also returns
+-- false for a spec with no target and for one that would make a loop (the
+-- editor's own cycle check, primary and backup both). The spec is copied, never
+-- kept.
+--
+-- Inside a live session the change goes through Session, so it is one undo step
+-- and Discard still puts it back. Outside one (or suspended for combat) the record
+-- is written and the consumer told through onChanged(pos, "anchor" / "detach"),
+-- which defers for secure elements in combat like every other write, and the
+-- element's dependants re-solve.
+-- ============================================================
+local function liveSessionFor(el)
+    local sess = NS.Session
+    if sess and sess:IsActive() and not sess:IsSuspended()
+        and Registry:IsInSession(sess.filter, el) then
+        return sess
+    end
+    return nil
+end
+
+local function applyScripted(el, reason)
+    NS:Notify(el, reason)
+    NS:ReapplyDescendants(el.id, "parent")
+    if NS.Proxy then NS.Proxy:Refresh(el.id) end
+end
+
+function Lib:Detach(addon, key)
+    local el = Registry:Get(Registry.Id(addon, key))
+    if not el then return false end
+    local sess = liveSessionFor(el)
+    if sess then
+        sess:Detach(el)
+        return true
+    end
+    local pos = Registry:GetPos(el)
+    if not pos.anchor then return true end
+    -- The solved x/y is where the element sits now, so freeing it moves nothing.
+    pos.anchor = nil
+    applyScripted(el, "detach")
+    return true
+end
+
+function Lib:SetAnchor(addon, key, spec)
+    if spec == nil then return Lib:Detach(addon, key) end
+    local el = Registry:Get(Registry.Id(addon, key))
+    if not el then return false end
+    if type(spec) ~= "table" or type(spec.target) ~= "string" then return false end
+    if Registry:WouldCreateCycle(el.id, spec.target) then return false end
+    local fb = spec.fallback
+    if fb and (type(fb.target) ~= "string" or Registry:WouldCreateCycle(el.id, fb.target)) then
+        return false
+    end
+    local anchor = NS.CopyPos({ anchor = spec }).anchor
+    anchor.offsetX, anchor.offsetY = anchor.offsetX or 0, anchor.offsetY or 0
+    if anchor.fallback then
+        anchor.fallback.offsetX = anchor.fallback.offsetX or 0
+        anchor.fallback.offsetY = anchor.fallback.offsetY or 0
+    end
+    local sess = liveSessionFor(el)
+    if sess then return sess:SetAnchor(el, anchor) end
+    local pos = Registry:GetPos(el)
+    pos.anchor = anchor
+    NS.RecenterRecord(el, pos)
+    NS:ResolveElement(el)
+    applyScripted(el, "anchor")
+    return true
+end
+
+-- SetPoint + scale maths for consumers that want it. Safe to call without the
+-- anchor block: only point/x/y are read.
+function Lib.ApplyPosition(frame, pos)
+    local ratio = frame:GetEffectiveScale() / UIParent:GetEffectiveScale()
+    frame:ClearAllPoints()
+    frame:SetPoint(pos.point or "CENTER", UIParent, "CENTER", (pos.x or 0) / ratio, (pos.y or 0) / ratio)
+end
+
+-- ============================================================
+-- WATCHER
+-- Lets a consumer register and forget: elements are applied for it, and it no longer
+-- has to tell the library when a frame moved, resized, hid, rescaled or was replaced.
+--
+-- ☠ COST IS THE WHOLE DESIGN. This runs five times a second for as long as anything is
+-- watched, so it only measures what something depends on, reuses its tables, and
+-- leaves the sweep to decide (with its epsilon) whether anything really changed. An
+-- addon that reports its own changes says watch = false, and if every addon does the
+-- ticker never exists.
+--
+-- ⚠ IT MEASURES THE TARGET ID THE RECORD NAMES, NOT THE CANONICAL ONE. ResolveElement
+-- reads the rect of a.target as written, so that is the rect a change has to be seen
+-- on, even when a.target is an alias whose frame belongs to an element. The graph walk
+-- (Descendants -> Children -> CanonicalId) folds aliases by itself once a raw id is
+-- swept, so a moved alias still reaches everything anchored to its element. It reads
+-- both blocks of an anchor rather than ParentId, because ParentId is only the ACTIVE
+-- parent and a backup or a hidden primary has to be seen changing while it is not.
+-- ============================================================
+local TICK_SECONDS = 0.2
+local RATIO_EPSILON = 0.001
+
+Watcher.ticker = nil
+Watcher.loggedIn = (IsLoggedIn and IsLoggedIn()) and true or false
+Watcher.flushScheduled = false
+Watcher.stats = { measured = 0, ticks = 0, lastMs = 0, maxMs = 0 }
+
+local function isSecret(v) return issecretvalue and issecretvalue(v) end
+
+-- Called under pcall. A frame's numbers are checked before Registry does arithmetic on
+-- them, because an error from that would look like a broken consumer.
+local function checkedRect(target)
+    if issecretvalue and not target.getRect then
+        local f = Registry:GetFrame(target)
+        if f then
+            local cx, cy = f:GetCenter()
+            local w, h = f:GetSize()
+            if isSecret(cx) or isSecret(cy) or isSecret(w) or isSecret(h)
+                or isSecret(f:GetEffectiveScale()) then
+                return SKIP_RECT
+            end
+        end
+    end
+    local r = targetRect(target)
+    if not r then return nil end
+    if type(r) ~= "table" then error("DandersMover: getRect for " .. target.id .. " must return a table", 0) end
+    if isSecret(r.x) or isSecret(r.y) or isSecret(r.w) or isSecret(r.h) then return SKIP_RECT end
+    if type(r.x) ~= "number" or type(r.y) ~= "number" or type(r.w) ~= "number" or type(r.h) ~= "number" then
+        error("DandersMover: rect for " .. target.id .. " needs numeric x, y, w and h", 0)
+    end
+    return r
+end
+
+local function watchMeasure(target)
+    if target.watchFailed then return SKIP_RECT end
+    local ok, r = pcall(checkedRect, target)
+    if ok then return r end
+    failWatch(target, r)
+    return SKIP_RECT
+end
+
+-- el -> { frame, ratio } as of the last look. Keyed by the library's own element table so
+-- nothing lands on the consumer's def, a rename keeps its state, and a re-registration
+-- starts fresh. Weak, so an unregistered element takes its entry with it.
+local frameState = setmetatable({}, { __mode = "k" })
+
+local function readFrame(el)
+    local f = Registry:GetFrame(el)
+    if not f then return nil end
+    local scale, uiScale = f:GetEffectiveScale(), UIParent:GetEffectiveScale()
+    if isSecret(scale) or isSecret(uiScale) then return SKIP_RECT end
+    return f, scale / uiScale
+end
+
+-- True when the element has to be applied again: it has a new frame, or its frame's
+-- scale relative to UIParent changed, so the SetPoint offsets it was given are wrong.
+-- The first look only records, except that a frame turning up later does apply.
+local function frameChanged(el)
+    local ok, f, ratio = pcall(readFrame, el)
+    if not ok then failWatch(el, f) return false end
+    if f == SKIP_RECT then return false end
+    local state = frameState[el]
+    if not state then
+        frameState[el] = { frame = f, ratio = ratio }
+        return false
+    end
+    local changed = false
+    if f ~= state.frame then
+        changed = f ~= nil      -- a frame that went away has nothing left to place
+    elseif f and abs(ratio - state.ratio) > RATIO_EPSILON then
+        changed = true
+    end
+    state.frame, state.ratio = f, ratio
+    return changed
+end
+
+-- Target ids a tick has to measure, reused so an idle tick allocates nothing of its own.
+local needs, measureIds, applyList = {}, {}, {}
+
+local function collectMeasured()
+    wipe(needs)
+    -- Every element, opted out or not: an opted-out follower can still depend on a
+    -- watched target, and the keep-list below is what drops an opted-out target.
+    for _, el in pairs(Registry.elements) do
+        local pos = Registry:GetPos(el)
+        local a = pos.anchor
+        if not el.recordBroken and type(a) == "table" then
+            if a.target ~= nil then needs[a.target] = true end
+            local fb = a.fallback
+            if type(fb) == "table" and fb.target ~= nil then needs[fb.target] = true end
+            -- Its own size feeds its own solve, so a resize makes it stale by itself.
+            if Registry:IsWatched(el) then needs[el.id] = true end
+        end
+    end
+    -- An open session draws a slab for each of these, and a slab has to resize with its
+    -- frame whether or not anything is anchored to it.
+    if Lib:IsUnlocked() then
+        for id, target in pairs(Registry.targets) do
+            if Registry:IsWatched(target) then needs[id] = true end
+        end
+    end
+    local n = 0
+    for id in pairs(needs) do
+        local target = Registry:GetTarget(id)
+        if target and not target.watchFailed and Registry:IsWatched(target) then
+            n = n + 1
+            measureIds[n] = id
+        end
+    end
+    for i = n + 1, #measureIds do measureIds[i] = nil end
+    return n
+end
+
+local function tickBody()
+    if NS.Proxy and NS.Proxy:IsDragging() then return false end
+
+    -- Before the sweep, so a new frame is in place by the time its followers are solved
+    -- against it. Collected first: Lib:Apply runs consumer code, which may register.
+    local nApply = 0
+    for _, el in pairs(Registry.elements) do
+        if not el.watchFailed and Registry:IsWatched(el) and frameChanged(el) then
+            nApply = nApply + 1
+            applyList[nApply] = el
+        end
+    end
+    for i = nApply + 1, #applyList do applyList[i] = nil end
+    for i = 1, nApply do
+        local el = applyList[i]
+        if Registry:Get(el.id) == el then
+            local ok, err = pcall(Lib.Apply, Lib, el.addon, el.key)
+            if not ok then reportOnce(el, err) end
+        end
+    end
+
+    local n = collectMeasured()
+    Watcher.stats.measured = n
+    if n > 0 then
+        sweeping = true
+        local ok, err = pcall(sweepIds, measureIds, watchMeasure)
+        sweeping = false
+        if not ok then error(err, 0) end
+    end
+    return true
+end
+
+-- A failure outside any one object's guard has nobody to mark, so it is heard once per message.
+local reportedTickErrors = {}
+
+local function reportTickError(err)
+    local msg = tostring(err)
+    if namesSecret(msg) or reportedTickErrors[msg] then return end
+    reportedTickErrors[msg] = true
+    _G.geterrorhandler()(err)
+end
+
+local function anyWatched()
+    for _, el in pairs(Registry.elements) do
+        if not el.watchFailed and Registry:IsWatched(el) then return true end
+    end
+    for _, target in pairs(Registry.targets) do
+        if not target.watchFailed and Registry:IsWatched(target) then return true end
+    end
+    return false
+end
+
+-- One pass over `els`, not n calls to Lib:Apply: parents first, then every descendant
+-- once, then one slab repaint. Reasons as in sweepIds: "reapply" and "parent".
+local function applyPass(els)
+    if #els == 0 then return end
+    local ids = {}
+    for i, el in ipairs(els) do ids[i] = el.id end
+    local function parentOf(id)
+        local ok, parent = pcall(NS.ParentOf, NS, id)
+        return ok and parent or nil
+    end
+    -- Only the ordering runs inside the memo: it calls no consumer code that can re-register.
+    Registry:BeginCanonMemo()
+    local ok, order = pcall(Solver.ResolutionOrder, ids, parentOf)
+    Registry:EndCanonMemo()
+    if not ok then error(order, 0) end
+    for _, id in ipairs(order) do
+        local el = Registry:Get(id)
+        if el and not el.watchFailed then
+            -- Records what this apply saw, so a frame arriving before the first tick
+            -- still counts as new rather than as already there.
+            frameChanged(el)
+            resolveForPass(el)
+            NS:Notify(el, "reapply")
+        end
+    end
+    NS:ReapplyDescendantsMany(order, "parent")
+    if NS.Proxy then NS.Proxy:SyncMany(order) end
+end
+
+local function guardedApplyPass(els)
+    local ok, err = pcall(applyPass, els)
+    if not ok then reportTickError(err) end
+end
+
+function Watcher:Start()
+    if self.ticker or not self.loggedIn then return end
+    local timer = C_Timer
+    if not (timer and timer.NewTicker) then return end
+    self.ticker = timer.NewTicker(TICK_SECONDS, function() Watcher:Tick() end)
+end
+
+function Watcher:Stop()
+    if self.ticker then self.ticker:Cancel() end
+    self.ticker = nil
+end
+
+function Watcher:Evaluate()
+    if not self.loggedIn then return end
+    if anyWatched() then self:Start() else self:Stop() end
+end
+
+-- Keyed by element table, so an Unregister (or a re-registration under the same id)
+-- before the flush simply drops out of it.
+local pendingApply = {}
+
+local function requestFlush()
+    if Watcher.flushScheduled then return end
+    local timer = C_Timer
+    if not (timer and timer.After) then return end
+    Watcher.flushScheduled = true
+    timer.After(0, function() Watcher:Flush() end)
+end
+
+function Watcher:Flush()
+    self.flushScheduled = false
+    local els = {}
+    for el in pairs(pendingApply) do
+        pendingApply[el] = nil
+        if Registry:Get(el.id) == el and not el.watchFailed and Registry:IsWatched(el) then
+            tinsert(els, el)
+        end
+    end
+    guardedApplyPass(els)
+end
+
+-- From Lib:Register / RegisterAnchorTarget. nil while the registry is still queueing;
+-- those reach the login pass, or OnRegistryFlushed if login has already happened.
+function Watcher:Registered(obj, isElement)
+    if not self.loggedIn or not obj or not Registry:IsWatched(obj) then return end
+    if isElement then
+        pendingApply[obj] = true
+        requestFlush()
+    end
+    self:Start()
+end
+
+function Watcher:OnLogin()
+    self.loggedIn = true
+    local els = {}
+    for _, el in pairs(Registry.elements) do
+        if not el.watchFailed and Registry:IsWatched(el) then tinsert(els, el) end
+    end
+    guardedApplyPass(els)
+    self:Evaluate()
+end
+
+-- The library loaded after login (load on demand), so PLAYER_LOGIN will not come for
+-- what was queued before its ADDON_LOADED.
+function Watcher:OnRegistryFlushed()
+    if not self.loggedIn then return end
+    for _, el in pairs(Registry.elements) do
+        if not el.watchFailed and Registry:IsWatched(el) then pendingApply[el] = true end
+    end
+    requestFlush()
+    self:Evaluate()
+end
+
+function Watcher:Tick()
+    if sweeping then return end
+    local clock = debugprofilestop
+    local started = clock and clock()
+    local ok, ran = pcall(tickBody)
+    if not ok then reportTickError(ran) end
+    if ok and not ran then return end     -- a drag is in flight: nothing was done
+    local stats = self.stats
+    stats.ticks = stats.ticks + 1
+    if started then
+        stats.lastMs = clock() - started
+        if stats.lastMs > stats.maxMs then stats.maxMs = stats.lastMs end
+    end
+    if self.ticker and not anyWatched() then self:Stop() end
+end
+
+-- For measuring the watcher's cost in game: /dump LibStub("DandersMover-1.0"):GetWatcherStats()
+--   running  the ticker exists       watched  element and target ids being looked after
+--   measured targets in the last tick  ticks  ticks run so far
+--   lastMs, maxMs  time per tick; stay 0 where debugprofilestop does not exist
+function Lib:GetWatcherStats()
+    local watched = 0
+    for _, el in pairs(Registry.elements) do
+        if Registry:IsWatched(el) then watched = watched + 1 end
+    end
+    for id, target in pairs(Registry.targets) do
+        if not Registry:Get(id) and Registry:IsWatched(target) then watched = watched + 1 end
+    end
+    local stats = Watcher.stats
+    return { running = Watcher.ticker ~= nil, watched = watched, measured = stats.measured,
+             ticks = stats.ticks, lastMs = stats.lastMs, maxMs = stats.maxMs }
+end
+
+-- ============================================================
+-- RESET
+-- Every element of one addon (or of all of them) back to the record its
+-- consumer declared as the default -- the centre of the screen when it declared
+-- none. The one rescue that needs no slab to click: an element solved off screen
+-- has its handle off screen with it, and the element panel's own Reset is only
+-- reachable through that handle. Inside a live session the reset goes through
+-- Session, so it is one undo step per element and Discard still puts it back;
+-- outside one (or suspended for combat) it applies straight away, deferring for
+-- secure elements the way every other write does.
+-- ============================================================
+function NS:ResetPositions(addon)
+    local sess = NS.Session
+    local live = sess and sess:IsActive() and not sess:IsSuspended()
+    local n = 0
+    for _, el in ipairs(Registry:SortedElements()) do
+        if not addon or el.addon == addon then
+            n = n + 1
+            if live and Registry:IsInSession(sess.filter, el) then
+                sess:Reset(el)
+            else
+                local pos = Registry:GetPos(el)
+                if el.default then
+                    NS.CopyPos(el.default, pos)
+                else
+                    wipe(pos)
+                    pos.point, pos.x, pos.y = "CENTER", 0, 0
+                end
+                if pos.anchor then NS:ResolveElement(el) end
+                NS:Notify(el, "reset")
+                NS:ReapplyDescendants(el.id, "parent")
+                if NS.Proxy then NS.Proxy:Refresh(el.id) end
+            end
+        end
+    end
+    return n
+end
+
+-- /mover reset all | <addon>. The addon is matched by its registry name, case
+-- blind (the slash line arrives lowercased). No argument, or one that names
+-- nothing, prints what there is to reset rather than resetting everything by
+-- surprise.
+function NS:ResetCommand(rest)
+    rest = (rest or ""):match("^%s*(.-)%s*$")
+    local names = {}
+    for name in pairs(Registry.addons) do tinsert(names, name) end
+    tsort(names)
+    local target
+    if rest == "all" then
+        target = false
+    else
+        for _, name in ipairs(names) do
+            if strlower(name) == rest then target = name end
+        end
+    end
+    if target == nil then
+        if rest ~= "" then NS:Print(format(L["No addon named %s has registered movers."], rest)) end
+        NS:Print(format(L["Usage: /mover reset all | <addon> — registered: %s"],
+            #names > 0 and tconcat(names, ", ") or L["None"]))
+        return
+    end
+    NS:Print(format(L["%d mover positions reset."], NS:ResetPositions(target or nil)))
+end
+
+-- ============================================================
+-- EVENTS
+-- ============================================================
+local events = CreateFrame("Frame")
+events:RegisterEvent("ADDON_LOADED")
+events:RegisterEvent("PLAYER_REGEN_DISABLED")
+events:RegisterEvent("PLAYER_REGEN_ENABLED")
+events:RegisterEvent("PLAYER_LOGIN")
+events:SetScript("OnEvent", function(_, event, arg1)
+    if event == "ADDON_LOADED" then
+        if arg1 ~= addonName then return end
+        DandersMoverDB = DandersMoverDB or {}
+        applyDefaults(DandersMoverDB, NS.DEFAULTS)
+        NS.db = DandersMoverDB
+        Registry:Flush()
+        -- One fire for the whole drained queue, not one per queued item.
+        registryChanged()
+        Watcher:OnRegistryFlushed()
+        events:UnregisterEvent("ADDON_LOADED")
+    elseif event == "PLAYER_LOGIN" then
+        Watcher:OnLogin()
+        events:UnregisterEvent("PLAYER_LOGIN")
+    elseif event == "PLAYER_REGEN_DISABLED" then
+        if NS.Session and NS.Session:IsActive() then NS.Session:Suspend() end
+    elseif event == "PLAYER_REGEN_ENABLED" then
+        NS:FlushPending()
+        if NS.Session and NS.Session:IsSuspended() then NS.Session:Resume() end
+    end
+end)
+
+-- ============================================================
+-- SLASH
+-- ============================================================
+SLASH_DANDERSMOVER1 = "/mover"
+SlashCmdList.DANDERSMOVER = function(msg)
+    local cmd, rest = strsplit(" ", strlower(msg or ""), 2)
+    if cmd == "" then
+        Lib:Toggle()
+    elseif cmd == "unlock" then Lib:Unlock()
+    elseif cmd == "lock" then Lib:Lock()
+    elseif cmd == "config" then if NS.Settings then NS.Settings:Toggle() end
+    elseif cmd == "reset" then NS:ResetCommand(rest)
+    elseif cmd == "debug" then NS.db.debug = not NS.db.debug; NS:Print("debug " .. tostring(NS.db.debug))
+    else
+        NS:Print(L["Usage: /mover [unlock|lock|config|reset]"])
+    end
+end
+
+-- Addon table exposed for /run diagnostics and the manual checklist.
+_G.DandersMover = NS
